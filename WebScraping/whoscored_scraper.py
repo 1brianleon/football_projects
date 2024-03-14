@@ -2,13 +2,20 @@
 import json 
 import time 
 import sys
+import re
+import os
+from dotenv import load_dotenv
 import numpy as np
 import pandas as pd 
 from bs4 import BeautifulSoup
 from pydantic import BaseModel
 from typing import List, Optional 
 from selenium import webdriver
+from selenium.common.exceptions import NoSuchElementException, WebDriverException
+from selenium.webdriver.common.by import By
 from supabase import create_client, Client
+
+
 
 #Define Pydantic models
 class Events(BaseModel):
@@ -55,6 +62,9 @@ class Matches(BaseModel):
     away_team_name: str
     match_minutes: int
     match_minutes_expanded: int
+    region: str
+    competition: str
+    season: str
 
 class Lineups(BaseModel):
     match_id: int
@@ -75,7 +85,7 @@ class Lineups(BaseModel):
 #Define database insertion functions 
 def insert_events(df, supabase):
     all_events = [
-        Events(**x).dict()
+        Events(**x).model_dump()
         for x in df.to_dict(orient='records')
     ]
     execution = supabase.table('events').upsert(all_events).execute()
@@ -107,12 +117,15 @@ def insert_matches(match_info, supabase):
             'away_team_name': match['away_team_name'],
             'match_minutes': match['match_minutes'],
             'match_minutes_expanded': match['match_minutes_expanded'],
+            'region': match['region'],
+            'season': match['season'],
+            'competition': match['competition'],
         })
     execution = supabase.table('matches').upsert(matches).execute()
 
 def insert_lineups(df, supabase):
     all_lineups = [
-        Lineups(**x).dict()
+        Lineups(**x).model_dump()
         for x in df.to_dict(orient='records')
     ]
     execution = supabase.table('lineups').upsert(all_lineups).execute()
@@ -126,12 +139,194 @@ def extract_period(x):
         return x
     
 
+#Helper Function to extract region, competition, and season from a given URL
+def extract_info_from_url(whoscored_url):
+    # Define a regular expression pattern to match the desired portions
+    pattern = r'/([^/]+)-([^/]+)-(\d{4}-\d{4})-'
+
+    # Search for the pattern in the URL
+    match = re.search(pattern, whoscored_url)
+
+    if match:
+        # Extract the matched portions
+        region = match.group(1)
+        competition = match.group(2)
+        season = match.group(3)
+        return region, competition, season
+    else:
+        print("Pattern not found in the URL:", whoscored_url)
+        return None, None, None
+    
+
+#Helper function to format and prepend match URLs
+def prepend_base_url(match_urls):
+    return ['https://www.whoscored.com' + url['url'] for url in match_urls]
+
+
+#Function to get all League URLs from WhoScored.com
+def getLeagueUrls(minimize_window=True):
+    
+    driver = webdriver.Chrome()
+    
+    if minimize_window:
+        driver.minimize_window()
+        
+    driver.get(main_url)
+    league_names = []
+    league_urls = []
+    n_tournaments = len(BeautifulSoup(driver.find_element(By.ID, 'popular-tournaments-list').get_attribute('innerHTML')).findAll('li'))
+    for i in range(n_tournaments):
+        league_name = driver.find_element(By.XPATH, '//*[@id="popular-tournaments-list"]/li['+str(i+1)+']/a').text
+        league_link = driver.find_element(By.XPATH, '//*[@id="popular-tournaments-list"]/li['+str(i+1)+']/a').get_attribute('href')
+        league_names.append(league_name)
+        league_urls.append(league_link)
+        
+    for link in league_urls:
+        if 'Russia' in link:
+            r_index = league_urls.index(link)
+            
+    league_names[r_index] = 'Russian Premier League'
+    
+    leagues = {}
+    for name,link in zip(league_names,league_urls):
+        leagues[name] = link
+    driver.close()
+    return leagues
+
+
+#Function to get all internal URL data 
+def getUrlData(driver):
+
+    matches_ls = []
+    while True:
+        table_rows = driver.find_elements(By.CLASS_NAME, 'divtable-row')
+        if len(table_rows) == 0:
+            if('is-disabled' in driver.find_element(By.XPATH, '//*[@id="date-controller"]/a[1]').get_attribute('class').split()):
+                break
+            else:
+                driver.find_element(By.XPATH, '//*[@id="date-controller"]/a[1]').click()
+        for row in table_rows:
+            match_dict = {}
+            element = BeautifulSoup(row.get_attribute('innerHTML'), features='lxml')
+            link_tag = element.find("a", {"class":"result-1 rc"})
+            if type(link_tag) is not type(None):
+                match_dict['url'] = link_tag.get("href")
+            matches_ls.append(match_dict)
+                
+        prev_month = driver.find_element(By.XPATH, '//*[@id="date-controller"]/a[1]').click()
+        time.sleep(2)
+        if driver.find_element(By.XPATH, '//*[@id="date-controller"]/a[1]').get_attribute('title') == 'No data for previous week':
+            table_rows = driver.find_elements(By.CLASS_NAME, 'divtable-row')
+            for row in table_rows:
+                match_dict = {}
+                element = BeautifulSoup(row.get_attribute('innerHTML'), features='lxml')
+                link_tag = element.find("a", {"class":"result-1 rc"})
+                if type(link_tag) is not type(None):
+                    match_dict['url'] = link_tag.get("href")
+                matches_ls.append(match_dict)
+            break
+    
+    matches_ls = list(filter(None, matches_ls))
+
+    return matches_ls
+
+
+#Function to get all Match URLs
+def getMatchUrls(comp_urls, competition, season, maximize_window=True):
+
+    driver = webdriver.Chrome()
+    
+    if maximize_window:
+        driver.maximize_window()
+    
+    comp_url = comp_urls[competition]
+    driver.get(comp_url)
+    time.sleep(5)
+    
+    seasons = driver.find_element(By.XPATH, '//*[@id="seasons"]').get_attribute('innerHTML').split(sep='\n')
+    seasons = [i for i in seasons if i]
+    
+    
+    for i in range(1, len(seasons)+1):
+        if driver.find_element(By.XPATH, '//*[@id="seasons"]/option['+str(i)+']').text == season:
+            driver.find_element(By.XPATH, '//*[@id="seasons"]/option['+str(i)+']').click()
+            
+            time.sleep(5)
+            try:
+                stages = driver.find_element(By.XPATH, '//*[@id="stages"]').get_attribute('innerHTML').split(sep='\n')
+                stages = [i for i in stages if i]
+                
+                all_urls = []
+            
+                for i in range(1, len(stages)+1):
+                    if competition == 'Champions League' or competition == 'Europa League':
+                        if 'Group Stages' in driver.find_element(By.XPATH, '//*[@id="stages"]/option['+str(i)+']').text or 'Final Stage' in driver.find_element_by_xpath('//*[@id="stages"]/option['+str(i)+']').text:
+                            driver.find_element(By.XPATH, '//*[@id="stages"]/option['+str(i)+']').click()
+                            time.sleep(5)
+                            
+                            driver.execute_script("window.scrollTo(0, 400)") 
+                            
+                            match_urls = getUrlData(driver)
+                            
+                            all_urls += match_urls
+                        else:
+                            continue
+                    
+                    elif competition == 'Major League Soccer':
+                        if 'Grp. ' not in driver.find_element(By.XPATH, '//*[@id="stages"]/option['+str(i)+']').text: 
+                            driver.find_element(By.XPATH, '//*[@id="stages"]/option['+str(i)+']').click()
+                            time.sleep(5)
+                        
+                            driver.execute_script("window.scrollTo(0, 400)")
+                            
+                            match_urls = getUrlData(driver)
+                            
+                            all_urls += match_urls
+                        else:
+                            continue
+                        
+                    else:
+                        driver.find_element(By.XPATH, '//*[@id="stages"]/option['+str(i)+']').click()
+                        time.sleep(5)
+                    
+                        driver.execute_script("window.scrollTo(0, 400)")
+                        
+                        match_urls = getUrlData(driver)
+                        
+                        all_urls += match_urls
+                
+            except NoSuchElementException:
+                all_urls = []
+                
+                driver.execute_script("window.scrollTo(0, 400)")
+                
+                match_urls = getUrlData(driver)
+                
+                all_urls += match_urls
+            
+            # Remove duplicates from all_urls
+            remove_dup = [dict(t) for t in {tuple(sorted(d.items())) for d in all_urls}]
+            remove_dup = list(filter(None, remove_dup))
+            
+            driver.close() 
+    
+            return remove_dup
+     
+    season_names = [re.search(r'\>(.*?)\<',season).group(1) for season in seasons]
+    driver.close() 
+    print('Seasons available: {}'.format(season_names))
+    raise('Season Not Found.')
+
+
 #Function to scrape data from WhoScored
 def scrape_whoscored_data(whoscored_url, driver):
     # Opening the URL in the browser
     driver.get(whoscored_url)
 
     match_id = int(whoscored_url.split("/")[-3])
+
+    # Extracting region, competition, and season from the URL
+    region, competition, season = extract_info_from_url(whoscored_url)
     
     # Creating a BeautifulSoup object to parse the HTML
     soup = BeautifulSoup(driver.page_source, 'html.parser')
@@ -246,7 +441,10 @@ def scrape_whoscored_data(whoscored_url, driver):
                 'home_team_name': matchDict['home']['name'],
                 'away_team_name': matchDict['away']['name'],
                 'match_minutes': matchDict['maxMinute'],
-                'match_minutes_expanded': matchDict['expandedMaxMinute']
+                'match_minutes_expanded': matchDict['expandedMaxMinute'],
+                'region': region,
+                'competition': competition,
+                'season': season,
             })
         
             insert_matches(match_info, supabase)
@@ -294,31 +492,29 @@ def scrape_whoscored_data(whoscored_url, driver):
         print(f"No Match Centre Data found for URL: {whoscored_url}")
     
 
-#Function to get all individual match URLs from the fixtures page 
-def get_match_urls(whoscored_url, driver):
-    driver.get(whoscored_url)
-    soup = BeautifulSoup(driver.page_source, 'html.parser')
-    all_urls = soup.select('a[href*="\/Live\/"]')
-    return list(set(['https://www.whoscored.com' + x.attrs['href'] for x in all_urls]))
-
-
 #Get Supabase client
-supabase_password = 'elde5y6u7ycHuiGV'
-project_url = 'https://kacepynzaervoccjqxxz.supabase.co'
-api_key = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImthY2VweW56YWVydm9jY2pxeHh6Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3MDUxMDE1NDYsImV4cCI6MjAyMDY3NzU0Nn0.mjN4MTyfX5GygOeoZaUV-IigQf47fzuQYeERkmcCmRI'
+load_dotenv()
+api_key = os.getenv("SUPABASE_KEY")
+project_url = os.getenv("SUPABASE_URL")
 supabase = create_client(project_url, api_key)
 
 #Set up the Selenium driver 
 driver = webdriver.Chrome()
 
-#Ask user for the WhoScored team fixtures URL 
-whoscored_url = input("Enter the WhoScored team fixtures URL: ")
+#defining our main URL
+main_url = 'https://www.whoscored.com/'
 
-#Get all individual match URLs 
-match_urls = get_match_urls(whoscored_url, driver)
+#Obtaining all the league URLs
+league_urls = getLeagueUrls()
+
+#Obtaining all the match URLs from a specific season and competition
+match_urls = getMatchUrls(comp_urls=league_urls, competition='Premier League', season='2023/2024')
+
+#Format all match URLs
+formatted_urls = prepend_base_url(match_urls)
 
 #Scrape data for each match URL 
-for url in match_urls:
+for url in formatted_urls:
     print(url)
     scrape_whoscored_data(url, driver)
     sys.stdout.flush()  # Flush output buffer
